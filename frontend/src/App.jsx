@@ -11,6 +11,7 @@ import {
 
 export default function App() {
   const [inputValue, setInputValue] = useState("");
+  const [selectedDate, setSelectedDate] = useState(todayISOLocal());
   const [todayLog, setTodayLog] = useState(null);
   const [logs, setLogs] = useState(null);
   const [stats, setStats] = useState(null);
@@ -47,7 +48,9 @@ export default function App() {
     loadData();
   }, [loadData]);
 
-  // Add number to today's count
+  const isToday = selectedDate === todayISOLocal();
+
+  // Add number to selected date's count
   const handleAdd = async () => {
     const num = parseInt(inputValue, 10);
     if (isNaN(num) || num <= 0) {
@@ -57,11 +60,26 @@ export default function App() {
 
     setSaving(true);
     try {
-      const newCount = (todayLog?.count || 0) + num;
-      const saved = await saveLog({ count: newCount });
-      setTodayLog(saved);
+      // Fetch the existing count for the selected date
+      let existingCount = 0;
+      if (isToday) {
+        existingCount = todayLog?.count || 0;
+      } else {
+        // Look up the selected date in our logs
+        const existing = logs?.find((l) => l.date === selectedDate);
+        existingCount = existing?.count || 0;
+      }
+
+      const newCount = existingCount + num;
+      const saved = await saveLog({ count: newCount, date: selectedDate });
+
+      if (isToday) {
+        setTodayLog(saved);
+      }
+
       setInputValue("");
-      showToast(`+${num} added — Today's total: ${newCount}`);
+      const dateLabel = isToday ? "Today" : selectedDate;
+      showToast(`+${num} added — ${dateLabel}'s total: ${newCount}`);
       const [logsData, statsData] = await Promise.all([fetchLogs(), fetchStats()]);
       setLogs(logsData);
       setStats(statsData);
@@ -120,8 +138,16 @@ export default function App() {
 
       {/* ─── Log Input (TOP) ─── */}
       <section className="log-section glass-card glass-card--glow">
-        <div className="log-section__label">Add today's count</div>
+        <div className="log-section__label">
+          {isToday ? "Add today's count" : `Add count for ${selectedDate}`}
+        </div>
         <div className="log-section__row">
+          <input
+            type="date"
+            className="log-input log-input--date"
+            value={selectedDate}
+            onChange={(e) => setSelectedDate(e.target.value)}
+          />
           <input
             type="number"
             className="log-input"
@@ -247,6 +273,14 @@ export default function App() {
       {toast && <div className={`toast toast--${toast.type}`}>{toast.message}</div>}
     </div>
   );
+}
+
+function todayISOLocal() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
 }
 
 function formatDate(isoDate) {

@@ -193,6 +193,14 @@ body::before {
   box-shadow: 0 0 0 3px var(--accent-glow);
 }
 
+.log-input--date {
+  flex: 0 0 160px;
+  font-size: 1rem;
+  padding: 14px 12px;
+  cursor: pointer;
+  color-scheme: dark; /* Makes the calendar icon look good in dark mode */
+}
+
 .log-input::placeholder {
   color: var(--text-muted);
   font-weight: 400;

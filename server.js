@@ -1,7 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const Database = require("better-sqlite3");
+const fs = require("fs");
+const initSqlJs = require("sql.js");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,36 +13,71 @@ app.use(express.json());
 
 // ─── Database Setup ───────────────────────────────────────────────────────────
 const dataDir = path.join(__dirname, "data");
-const fs = require("fs");
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
-const db = new Database(path.join(dataDir, "namjap.db"));
+const DB_PATH = path.join(dataDir, "namjap.db");
+let db; // sql.js Database instance
 
-// Enable WAL mode for better concurrent performance
-db.pragma("journal_mode = WAL");
+async function initDB() {
+  const SQL = await initSqlJs();
 
-// Create table if it doesn't exist (same schema as the Flask version)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS daily_logs (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    date      TEXT    NOT NULL UNIQUE,
-    count     INTEGER NOT NULL DEFAULT 0,
-    notes     TEXT    DEFAULT '',
-    created_at TEXT   NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT   NOT NULL DEFAULT (datetime('now'))
-  )
-`);
+  // Load existing database if it exists, otherwise create new
+  if (fs.existsSync(DB_PATH)) {
+    const fileBuffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(fileBuffer);
+  } else {
+    db = new SQL.Database();
+  }
+
+  // Create table if it doesn't exist (same schema as the Flask version)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS daily_logs (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      date       TEXT    NOT NULL UNIQUE,
+      count      INTEGER NOT NULL DEFAULT 0,
+      notes      TEXT    DEFAULT '',
+      created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  saveDB();
+}
+
+// Persist database to disk
+function saveDB() {
+  const data = db.export();
+  const buffer = Buffer.from(data);
+  fs.writeFileSync(DB_PATH, buffer);
+}
 
 // ─── Helper: today's date as ISO string (YYYY-MM-DD) ─────────────────────────
 function todayISO() {
   const now = new Date();
-  // Use local date so it matches the user's day
   const y = now.getFullYear();
   const m = String(now.getMonth() + 1).padStart(2, "0");
   const d = String(now.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+// Helper: run a query and return all rows as objects
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return rows;
+}
+
+// Helper: run a query and return first row as object (or null)
+function queryOne(sql, params = []) {
+  const rows = queryAll(sql, params);
+  return rows.length > 0 ? rows[0] : null;
 }
 
 // ─── API Routes ───────────────────────────────────────────────────────────────
@@ -49,14 +85,12 @@ function todayISO() {
 // GET /api/today — get or create today's log
 app.get("/api/today", (req, res) => {
   const today = todayISO();
-  let row = db.prepare("SELECT * FROM daily_logs WHERE date = ?").get(today);
+  let row = queryOne("SELECT * FROM daily_logs WHERE date = ?", [today]);
 
   if (!row) {
-    const stmt = db.prepare(
-      "INSERT INTO daily_logs (date, count, notes) VALUES (?, 0, '')"
-    );
-    const info = stmt.run(today);
-    row = db.prepare("SELECT * FROM daily_logs WHERE id = ?").get(info.lastInsertRowid);
+    db.run("INSERT INTO daily_logs (date, count, notes) VALUES (?, 0, '')", [today]);
+    saveDB();
+    row = queryOne("SELECT * FROM daily_logs WHERE date = ?", [today]);
   }
 
   res.json(formatRow(row));
@@ -67,20 +101,22 @@ app.post("/api/log", (req, res) => {
   const { count = 0, notes = "", date: logDate } = req.body;
   const targetDate = logDate || todayISO();
 
-  let row = db.prepare("SELECT * FROM daily_logs WHERE date = ?").get(targetDate);
+  let row = queryOne("SELECT * FROM daily_logs WHERE date = ?", [targetDate]);
 
   if (row) {
-    db.prepare(
-      "UPDATE daily_logs SET count = ?, notes = ?, updated_at = datetime('now') WHERE id = ?"
-    ).run(count, notes, row.id);
-    row = db.prepare("SELECT * FROM daily_logs WHERE id = ?").get(row.id);
+    db.run(
+      "UPDATE daily_logs SET count = ?, notes = ?, updated_at = datetime('now') WHERE id = ?",
+      [count, notes, row.id]
+    );
   } else {
-    const info = db.prepare(
-      "INSERT INTO daily_logs (date, count, notes) VALUES (?, ?, ?)"
-    ).run(targetDate, count, notes);
-    row = db.prepare("SELECT * FROM daily_logs WHERE id = ?").get(info.lastInsertRowid);
+    db.run(
+      "INSERT INTO daily_logs (date, count, notes) VALUES (?, ?, ?)",
+      [targetDate, count, notes]
+    );
   }
 
+  saveDB();
+  row = queryOne("SELECT * FROM daily_logs WHERE date = ?", [targetDate]);
   res.json(formatRow(row));
 });
 
@@ -100,14 +136,14 @@ app.get("/api/logs", (req, res) => {
   }
 
   sql += " ORDER BY date DESC";
-  const rows = db.prepare(sql).all(...params);
+  const rows = queryAll(sql, params);
   res.json(rows.map(formatRow));
 });
 
 // PUT /api/log/:id — update a specific log
 app.put("/api/log/:id", (req, res) => {
   const { id } = req.params;
-  const row = db.prepare("SELECT * FROM daily_logs WHERE id = ?").get(id);
+  const row = queryOne("SELECT * FROM daily_logs WHERE id = ?", [Number(id)]);
 
   if (!row) {
     return res.status(404).json({ error: "Not found" });
@@ -115,38 +151,40 @@ app.put("/api/log/:id", (req, res) => {
 
   const { count, notes } = req.body;
   if (count !== undefined) {
-    db.prepare("UPDATE daily_logs SET count = ?, updated_at = datetime('now') WHERE id = ?").run(
-      count,
-      id
+    db.run(
+      "UPDATE daily_logs SET count = ?, updated_at = datetime('now') WHERE id = ?",
+      [count, Number(id)]
     );
   }
   if (notes !== undefined) {
-    db.prepare("UPDATE daily_logs SET notes = ?, updated_at = datetime('now') WHERE id = ?").run(
-      notes,
-      id
+    db.run(
+      "UPDATE daily_logs SET notes = ?, updated_at = datetime('now') WHERE id = ?",
+      [notes, Number(id)]
     );
   }
 
-  const updated = db.prepare("SELECT * FROM daily_logs WHERE id = ?").get(id);
+  saveDB();
+  const updated = queryOne("SELECT * FROM daily_logs WHERE id = ?", [Number(id)]);
   res.json(formatRow(updated));
 });
 
 // DELETE /api/log/:id — delete a log
 app.delete("/api/log/:id", (req, res) => {
   const { id } = req.params;
-  const row = db.prepare("SELECT * FROM daily_logs WHERE id = ?").get(id);
+  const row = queryOne("SELECT * FROM daily_logs WHERE id = ?", [Number(id)]);
 
   if (!row) {
     return res.status(404).json({ error: "Not found" });
   }
 
-  db.prepare("DELETE FROM daily_logs WHERE id = ?").run(id);
+  db.run("DELETE FROM daily_logs WHERE id = ?", [Number(id)]);
+  saveDB();
   res.json({ message: "Deleted", id: Number(id) });
 });
 
 // GET /api/stats — aggregate statistics
 app.get("/api/stats", (req, res) => {
-  const rows = db.prepare("SELECT * FROM daily_logs ORDER BY date DESC").all();
+  const rows = queryAll("SELECT * FROM daily_logs ORDER BY date DESC");
 
   if (rows.length === 0) {
     return res.json({
@@ -209,8 +247,10 @@ app.get("*", (req, res) => {
 });
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🕉️  NamJap server running on http://localhost:${PORT}`);
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🕉️  NamJap server running on http://localhost:${PORT}`);
+  });
 });
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
